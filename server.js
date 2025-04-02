@@ -5,18 +5,22 @@ const axios = require('axios');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
+const WebSocket = require('ws');
+const http = require('http');
 
 const app = express();
-const port = 4000;
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
-app.use(cors({ origin: '*' }));
+const port = 8081;
+const cache = new NodeCache();
+
+// Store active WebSocket connections
+const clients = new Map();
+const matchSubscriptions = new Map(); // Track which clients are subscribed to which matches
+
+app.use(cors());
 app.use(express.json());
-
-const cache = new NodeCache({ 
-  stdTTL: 2, // Cache for 2 seconds instead of 15
-  checkperiod: 1, // Check expired keys every 1 second
-  useClones: false // Don't clone data (faster)
-});
 
 // ✅ Rotate through tokens
 const AUTH_TOKENS = [
@@ -222,6 +226,17 @@ class TokenManager {
     }
     return false;
   }
+
+  // Get a valid token
+  getValidToken() {
+    const token = this.getToken();
+    if (!token) {
+      console.log('⚠️ No valid token available, attempting renewal...');
+      this.renewAllTokens();
+      return this.getToken();
+    }
+    return token;
+  }
 }
 
 // Initialize token manager
@@ -298,192 +313,490 @@ const fetchData = async (url, retries = 3) => {
   }
 };
 
-// ✅ Transform Market Data for Display
+// Transform Market Data for Display
 const transformMarketData = (market) => {
+  // Base market data that's common to all types
+  const baseMarket = {
+    id: market.id,
+    name: market.name,
+    groupById: market.groupById,
+    status: market.status,
+    statusLabel: market.statusLabel,
+    inPlay: market.inPlay,
+    btype: market.btype,
+    mtype: market.mtype,
+    start: market.start,
+    competition: market.competition,
+    event: market.event,
+    isStreamAvailable: market.isStreamAvailable,
+    isFancy: market.isFancy,
+    maxBet: market.maxBet,
+    maxMarket: market.maxMarket,
+    minBet: market.minBet,
+    betDelay: market.betDelay
+  };
+
+  // Match Odds markets
   if (market.mtype === 'MATCH_ODDS' || market.mtype === 'MATCH_ODDS_SB') {
     return {
-      ...market,
+      ...baseMarket,
       displayType: 'MATCH_ODDS',
-      runners: market.runners.map(runner => ({
-        ...runner,
-        back: runner.back?.[0] || { price: 0, size: 0 },
-        lay: runner.lay?.[0] || { price: 0, size: 0 }
-      }))
+      runners: market.runners?.map(runner => ({
+        id: runner.id,
+        name: runner.name,
+        status: runner.status,
+        back: Array.isArray(runner.back) ? runner.back : [runner.back].filter(Boolean),
+        lay: Array.isArray(runner.lay) ? runner.lay : [runner.lay].filter(Boolean),
+        sequence: runner.sequence,
+        runnerState: runner.runnerState
+      })) || []
     };
   }
 
-  if (market.btype === 'LINE' || market.mtype === 'INNINGS_RUNS' || market.name.includes('Over') || market.name.includes('Lambi')) {
+  // Fancy markets (including session odds, over runs, etc.)
+  if (market.btype === 'LINE' || 
+      market.mtype === 'INNINGS_RUNS' || 
+      market.name.includes('Over') || 
+      market.name.includes('Session') || 
+      market.name.includes('Lambi') ||
+      market.isFancy) {
     return {
-      ...market,
+      ...baseMarket,
       displayType: 'FANCY',
-      name: market.name,
-      status: market.status,
-      runners: [
-        {
-          no: {
-            price: market.runners[0]?.back?.[0]?.price || 0,
-            size: market.runners[0]?.back?.[0]?.size || 0
-          },
-          yes: {
-            price: market.runners[0]?.lay?.[0]?.price || 0,
-            size: market.runners[0]?.lay?.[0]?.size || 0
-          }
-        }
-      ]
+      runners: market.runners?.map(runner => ({
+        id: runner.id,
+        name: runner.name,
+        status: runner.status,
+        // For fancy markets, back is typically "YES" and lay is "NO"
+        yes: {
+          price: runner.back?.[0]?.price || runner.back?.price || 0,
+          size: runner.back?.[0]?.size || runner.back?.size || 0
+        },
+        no: {
+          price: runner.lay?.[0]?.price || runner.lay?.price || 0,
+          size: runner.lay?.[0]?.size || runner.lay?.size || 0
+        },
+        sequence: runner.sequence,
+        runnerState: runner.runnerState,
+        minStake: runner.minStake,
+        maxStake: runner.maxStake
+      })) || [],
+      minStake: market.minStake,
+      maxStake: market.maxStake,
+      betLock: market.betLock,
+      suspended: market.status === 'SUSPENDED'
     };
   }
 
+  // Bookmaker markets
+  if (market.isBookmaker || market.name.includes('BOOKMAKER')) {
+    return {
+      ...baseMarket,
+      displayType: 'BOOKMAKER',
+      runners: market.runners?.map(runner => ({
+        id: runner.id,
+        name: runner.name,
+        status: runner.status,
+        back: Array.isArray(runner.back) ? runner.back : [runner.back].filter(Boolean),
+        lay: Array.isArray(runner.lay) ? runner.lay : [runner.lay].filter(Boolean),
+        sequence: runner.sequence,
+        runnerState: runner.runnerState
+      })) || []
+    };
+  }
+
+  // Toss markets
   if (market.name.toLowerCase().includes('toss')) {
     return {
-      ...market,
+      ...baseMarket,
       displayType: 'TOSS',
-      runners: market.runners.map(runner => ({
-        ...runner,
-        back: runner.back?.[0] || { price: 0, size: 0 },
-        lay: runner.lay?.[0] || { price: 0, size: 0 }
-      }))
+      runners: market.runners?.map(runner => ({
+        id: runner.id,
+        name: runner.name,
+        status: runner.status,
+        back: Array.isArray(runner.back) ? runner.back : [runner.back].filter(Boolean),
+        lay: Array.isArray(runner.lay) ? runner.lay : [runner.lay].filter(Boolean),
+        sequence: runner.sequence
+      })) || []
     };
   }
 
-  return market;
+  // Other markets (fall through case)
+  return {
+    ...baseMarket,
+    displayType: 'OTHER',
+    runners: market.runners?.map(runner => ({
+      id: runner.id,
+      name: runner.name,
+      status: runner.status,
+      back: Array.isArray(runner.back) ? runner.back : [runner.back].filter(Boolean),
+      lay: Array.isArray(runner.lay) ? runner.lay : [runner.lay].filter(Boolean),
+      sequence: runner.sequence,
+      runnerState: runner.runnerState
+    })) || []
+  };
 };
 
-// ✅ Endpoint: Get Match List
-app.get('/api/match-list', async (req, res) => {
-  const cacheKey = 'match-list';
-  const cachedData = cache.get(cacheKey);
+// WebSocket message handler to broadcast market updates
+const broadcastMarketUpdate = (wss, market) => {
+  const transformedMarket = transformMarketData(market);
+  
+  // Broadcast to all connected clients
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({
+        type: 'marketUpdate',
+        data: transformedMarket
+      }));
+    }
+  });
+};
 
-  if (cachedData) {
-    console.log('✅ Serving match-list from cache');
-    return res.json(cachedData);
+// Function to process market data before sending
+const processMarketData = (markets) => {
+  if (!Array.isArray(markets)) {
+    console.error('❌ Invalid market data format:', markets);
+    return [];
+  }
+
+  return markets
+    .filter(market => market && market.name) // Filter out invalid markets
+    .map(transformMarketData)
+    .filter(market => market.displayType); // Filter out markets that couldn't be transformed
+};
+
+// Market Data Store for centralized data management
+class MarketDataStore {
+  constructor() {
+    this.matchListData = null;
+    this.matchDetailsData = new Map();
+    this.subscribers = new Map();
+    this.lastFetchTimes = new Map();
+  }
+
+  // Store match list data
+  setMatchList(data) {
+    this.matchListData = data;
+    this.broadcastMatchList();
+  }
+
+  // Store match details data
+  setMatchDetails(matchId, data) {
+    this.matchDetailsData.set(matchId, data);
+    this.broadcastMatchDetails(matchId);
+  }
+
+  // Get match list data
+  getMatchList() {
+    return this.matchListData;
+  }
+
+  // Get match details data
+  getMatchDetails(matchId) {
+    return this.matchDetailsData.get(matchId);
+  }
+
+  // Subscribe client to updates
+  subscribe(clientId, ws) {
+    this.subscribers.set(clientId, {
+      ws,
+      matchIds: new Set(),
+      wantsList: false
+    });
+  }
+
+  // Unsubscribe client
+  unsubscribe(clientId) {
+    this.subscribers.delete(clientId);
+  }
+
+  // Subscribe client to match list updates
+  subscribeToMatchList(clientId) {
+    const subscriber = this.subscribers.get(clientId);
+    if (subscriber) {
+      subscriber.wantsList = true;
+      // Send initial data if available
+      if (this.matchListData) {
+        this.sendToClient(clientId, {
+          type: 'matchList',
+          data: this.matchListData
+        });
+      }
+    }
+  }
+
+  // Subscribe client to match details updates
+  subscribeToMatch(clientId, matchId) {
+    const subscriber = this.subscribers.get(clientId);
+    if (subscriber) {
+      subscriber.matchIds.add(matchId);
+      // Send initial data if available
+      const matchData = this.matchDetailsData.get(matchId);
+      if (matchData) {
+        this.sendToClient(clientId, {
+          type: 'matchDetails',
+          matchId,
+          data: matchData
+        });
+      }
+    }
+  }
+
+  // Unsubscribe client from match updates
+  unsubscribeFromMatch(clientId, matchId) {
+    const subscriber = this.subscribers.get(clientId);
+    if (subscriber) {
+      subscriber.matchIds.delete(matchId);
+    }
+  }
+
+  // Broadcast match list to all subscribed clients
+  broadcastMatchList() {
+    const message = JSON.stringify({
+      type: 'matchList',
+      data: this.matchListData
+    });
+
+    for (const [clientId, subscriber] of this.subscribers) {
+      if (subscriber.wantsList && subscriber.ws.readyState === WebSocket.OPEN) {
+        subscriber.ws.send(message);
+      }
+    }
+  }
+
+  // Broadcast match details to subscribed clients
+  broadcastMatchDetails(matchId) {
+    const data = this.matchDetailsData.get(matchId);
+    if (!data) return;
+
+    const message = JSON.stringify({
+      type: 'matchDetails',
+      matchId,
+      data
+    });
+
+    for (const [clientId, subscriber] of this.subscribers) {
+      if (subscriber.matchIds.has(matchId) && subscriber.ws.readyState === WebSocket.OPEN) {
+        subscriber.ws.send(message);
+      }
+    }
+  }
+
+  // Send data to specific client
+  sendToClient(clientId, data) {
+    const subscriber = this.subscribers.get(clientId);
+    if (subscriber && subscriber.ws.readyState === WebSocket.OPEN) {
+      subscriber.ws.send(JSON.stringify(data));
+    }
+  }
+
+  // Check if we need to fetch new data
+  shouldFetch(key) {
+    const lastFetch = this.lastFetchTimes.get(key);
+    if (!lastFetch) return true;
+
+    const now = Date.now();
+    // For match list: fetch if last fetch was more than 30 seconds ago
+    if (key === 'matchList') {
+      return (now - lastFetch) > 30000;
+    }
+    // For match details: fetch if last fetch was more than 500ms ago
+    return (now - lastFetch) > 500;
+  }
+
+  // Update last fetch time
+  updateFetchTime(key) {
+    this.lastFetchTimes.set(key, Date.now());
+  }
+
+  // Get all active match IDs
+  getActiveMatchIds() {
+    const activeMatches = new Set();
+    for (const subscriber of this.subscribers.values()) {
+      for (const matchId of subscriber.matchIds) {
+        activeMatches.add(matchId);
+      }
+    }
+    return Array.from(activeMatches);
+  }
+}
+
+// Initialize market data store
+const marketStore = new MarketDataStore();
+
+// Update the data fetcher to use the market store
+class DataFetcher {
+  constructor(tokenManager, marketStore) {
+    this.tokenManager = tokenManager;
+    this.marketStore = marketStore;
+  }
+
+  async fetchMatchList() {
+    // Only fetch if enough time has passed since last fetch
+    if (!this.marketStore.shouldFetch('matchList')) {
+      return this.marketStore.getMatchList();
   }
 
   try {
-    // Ensure we have valid tokens before making the API call
-    if (tokenManager.tokens.some(token => !token)) {
-      console.log('⚠️ Some tokens are missing, attempting renewal...');
-      await tokenManager.renewAllTokens();
-    }
-    
-    const data = await fetchData('https://gobook9.com/api/exchange/odds/eventType/4');
-    
-    if (!data || !data.result) {
-      console.error('❌ Invalid data received from API:', data);
-      return res.status(500).json({ error: 'Invalid data received from API' });
-    }
-    
-    // Filter out any matches with tabGroupName "Premium Cricket"
-    const filteredData = data.result.filter(match => match.tabGroupName !== 'Premium Cricket');
-    
-    const transformedData = filteredData.map(transformMarketData);
+      const token = this.tokenManager.getValidToken();
+      if (!token) {
+        console.error('❌ No valid token available for match list');
+        return null;
+      }
 
-    cache.set(cacheKey, transformedData, 30); // Cache for 30 seconds
-    console.log('✅ Serving match-list from API');
-    res.json(transformedData);
+      const response = await axios.get('https://gobook9.com/api/exchange/odds/eventType/4', {
+        headers: {
+          'Authorization': token,
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0',
+          'Accept': 'application/json, text/plain, */*',
+          'Origin': 'https://gobook9.com',
+          'Referer': 'https://gobook9.com/sports/4'
+        }
+      });
+
+      if (!response.data || !response.data.result) {
+        console.error('❌ Invalid data received from API:', response.data);
+        return null;
+      }
+
+      const filteredData = response.data.result
+        .filter(match => match.tabGroupName !== 'Premium Cricket');
+
+      this.marketStore.setMatchList(filteredData);
+      this.marketStore.updateFetchTime('matchList');
+      return filteredData;
   } catch (error) {
     console.error('❌ Error fetching match list:', error.message);
-    
-    // Clear cache on error to force fresh data on next request
-    cache.del(cacheKey);
-    
-    // Try to renew tokens on error
-    tokenManager.renewAllTokens().catch(e => console.error('❌ Token renewal failed:', e.message));
-    
-    res.status(500).json({ error: 'Failed to fetch match list', message: error.message });
+      return null;
+    }
   }
+
+  async fetchMatchDetails(matchId) {
+    // Only fetch if enough time has passed since last fetch
+    if (!this.marketStore.shouldFetch(matchId)) {
+      return this.marketStore.getMatchDetails(matchId);
+    }
+
+    try {
+      const token = this.tokenManager.getValidToken();
+      if (!token) {
+        console.error(`❌ No valid token available for match ${matchId}`);
+        return null;
+      }
+
+      // First try d-sma-event API format
+      try {
+        const response = await axios.get(`https://gobook9.com/api/exchange/odds/d-sma-event/4/${matchId}`, {
+          headers: {
+            'Authorization': token,
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0',
+            'Accept': 'application/json, text/plain, */*',
+            'Origin': 'https://gobook9.com',
+            'Referer': 'https://gobook9.com/sports/4'
+          }
+        });
+
+        if (response.data && response.data.result) {
+          const filteredMarkets = response.data.result
+            .filter(market => market.tabGroupName !== 'Premium Cricket')
+            .map(market => transformMarketData(market));
+
+          this.marketStore.setMatchDetails(matchId, filteredMarkets);
+          this.marketStore.updateFetchTime(matchId);
+          return filteredMarkets;
+        }
+      } catch (firstError) {
+        console.log(`⚠️ d-sma-event API failed: ${firstError.message}. Trying alternative...`);
+      }
+
+      // Try direct event API as fallback
+      const response = await axios.get(`https://gobook9.com/api/exchange/odds/event/${matchId}`, {
+        headers: {
+          'Authorization': token,
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0',
+          'Accept': 'application/json, text/plain, */*',
+          'Origin': 'https://gobook9.com',
+          'Referer': 'https://gobook9.com/sports/4'
+        }
+      });
+
+      if (response.data && response.data.result) {
+        const filteredMarkets = response.data.result
+          .filter(market => market.tabGroupName !== 'Premium Cricket')
+          .map(market => transformMarketData(market));
+
+        this.marketStore.setMatchDetails(matchId, filteredMarkets);
+        this.marketStore.updateFetchTime(matchId);
+        return filteredMarkets;
+      }
+
+      return null;
+    } catch (error) {
+      console.error(`❌ Error fetching match details for ${matchId}:`, error.message);
+      return null;
+    }
+  }
+}
+
+// Initialize data fetcher with market store
+const dataFetcher = new DataFetcher(tokenManager, marketStore);
+
+// Update WebSocket connection handler
+wss.on('connection', (ws) => {
+  const clientId = Date.now();
+  marketStore.subscribe(clientId, ws);
+
+  console.log(`🔌 Client ${clientId} connected`);
+
+  ws.on('message', async (message) => {
+    try {
+      const data = JSON.parse(message);
+      
+      if (data.type === 'subscribe') {
+        if (data.matchId) {
+          marketStore.subscribeToMatch(clientId, data.matchId);
+        } else {
+          marketStore.subscribeToMatchList(clientId);
+        }
+      } else if (data.type === 'unsubscribe') {
+        if (data.matchId) {
+          marketStore.unsubscribeFromMatch(clientId, data.matchId);
+        } else {
+          marketStore.unsubscribe(clientId);
+        }
+      }
+    } catch (error) {
+      console.error('❌ Error processing message:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    marketStore.unsubscribe(clientId);
+    console.log(`🔌 Client ${clientId} disconnected`);
+  });
 });
 
-// ✅ Endpoint to Get Match Details by `groupById`
-app.get('/api/match-details/:groupById', async (req, res) => {
-  const { groupById } = req.params;
-  const cacheKey = `match-details-${groupById}`;
-  const cachedData = cache.get(cacheKey);
+// Update data fetching intervals
+async function updateMatchData() {
+  // Fetch match list every 30 seconds
+  setInterval(async () => {
+    await dataFetcher.fetchMatchList();
+  }, 30000);
 
-  if (cachedData) {
-    console.log(`✅ Serving match-details for ${groupById} from cache`);
-    return res.json(cachedData);
-  }
-
-  try {
-    console.log(`🔎 Fetching details for groupById: ${groupById}`);
-    
-    // Ensure we have valid tokens before making API calls
-    if (tokenManager.tokens.some(token => !token)) {
-      console.log('⚠️ Some tokens are missing, attempting renewal...');
-      await tokenManager.renewAllTokens();
+  // Fetch match details every 500ms
+  setInterval(async () => {
+    const activeMatches = marketStore.getActiveMatchIds();
+    for (const matchId of activeMatches) {
+      await dataFetcher.fetchMatchDetails(matchId);
     }
-    
-    // First try to get match details with the d-sma-event API format (as shown in curl examples)
-    try {
-      // Using the format from curl examples: /api/exchange/odds/d-sma-event/4/{groupById}
-      const data = await fetchData(`https://gobook9.com/api/exchange/odds/d-sma-event/4/${groupById}`);
-      
-      if (data && data.result) {
-        // Filter out markets with tabGroupName "Premium Cricket"
-        const filteredMarkets = data.result.filter(market => market.tabGroupName !== 'Premium Cricket');
-        
-        // Group markets by their type for better frontend organization
-        cache.set(cacheKey, filteredMarkets, 2); // Cache for 2 seconds
-        
-        console.log(`✅ Serving ${filteredMarkets.length} markets for match ${groupById} using d-sma-event API`);
-        return res.json(filteredMarkets);
-      }
-    } catch (specificError) {
-      console.log(`⚠️ d-sma-event API failed: ${specificError.message}. Trying alternative...`);
-      // Continue to next approach if specific API fails
-    }
-    
-    // Second attempt: Try the direct event API
-    try {
-      const data = await fetchData(`https://gobook9.com/api/exchange/odds/event/${groupById}`);
-      
-      if (data && data.result && data.result.length > 0) {
-        // Filter out markets with tabGroupName "Premium Cricket"
-        const filteredMarkets = data.result.filter(market => market.tabGroupName !== 'Premium Cricket');
-        
-        cache.set(cacheKey, filteredMarkets, 2); // Cache for 2 seconds
-        
-        console.log(`✅ Serving ${filteredMarkets.length} markets for match ${groupById} using event API`);
-        return res.json(filteredMarkets);
-      }
-    } catch (secondError) {
-      console.log(`⚠️ Event API failed: ${secondError.message}. Trying fallback...`);
-      // Continue to fallback approach if direct event API fails
-    }
+  }, 500);
+}
 
-    // Fallback: Get all matches and filter by groupById
-    const allData = await fetchData('https://gobook9.com/api/exchange/odds/eventType/4');
-    
-    if (!allData || !allData.result) {
-      return res.status(500).json({ error: 'Invalid data received from API' });
-    }
-    
-    // Find the match with the matching groupById and filter Premium Cricket
-    const matchDetails = allData.result
-      .filter(match => String(match.groupById) === String(groupById))
-      .filter(match => match.tabGroupName !== 'Premium Cricket');
-
-    if (!matchDetails || matchDetails.length === 0) {
-      console.log(`❌ No match found for groupById: ${groupById}`);
-      return res.status(404).json({ error: 'Match not found' });
-    }
-
-    cache.set(cacheKey, matchDetails, 2); // Cache for 2 seconds
-    console.log(`✅ Serving ${matchDetails.length} markets for match ${groupById} (via fallback)`);
-    return res.json(matchDetails);
-  } catch (error) {
-    console.error(`❌ Error fetching match details:`, error.message);
-    
-    // Clear cache on error to force fresh data on next request
-    cache.del(cacheKey);
-    
-    // Try to renew tokens on error
-    tokenManager.renewAllTokens().catch(e => console.error('❌ Token renewal failed:', e.message));
-    
-    res.status(500).json({ error: 'Failed to fetch match details', message: error.message });
-  }
-});
-
-app.listen(port, () => {
-  console.log(`🚀 Server is running on port ${port}`);
+// Start the server
+server.listen(port, () => {
+  console.log(`🚀 Server running on port ${port}`);
+  updateMatchData();
 });
